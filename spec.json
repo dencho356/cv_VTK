@@ -1,0 +1,284 @@
+{
+  "harness_types": {
+    "default": {
+      "description": "5-wire harness (TX4/RX4/+4.7/GND/+5 connector), read from clear, well-lit, in-focus reference photos on 2026-08-19. Supersedes the earlier 6-wire guess, which was based on a blurrier image. Still not confirmed by a manual inspector. require_solder_reach is false: tested true against the static reference photos and it passed there, but live testing on 2026-08-19 was worse, not better - real camera lighting/angle apparently pushes the actual solder joint color outside the HSV range calibrated from those specific photos often enough to wrongly reject real wires. The underlying solder-anchoring code (build_solder_reach_mask) is still there and does work when the solder color is well-matched - it just isn't reliable enough live yet to enable by default.",
+      "expected_color_sequence": [
+        "yellow",
+        "blue",
+        "teal",
+        "black",
+        "red"
+      ],
+      "check_order": true,
+      "require_solder_reach": false,
+      "strip_position": "bottom",
+      "wire_slots": [
+        {
+          "slot": 1,
+          "pad_label": "TX4",
+          "expected_color": "yellow"
+        },
+        {
+          "slot": 2,
+          "pad_label": "RX4",
+          "expected_color": "blue"
+        },
+        {
+          "slot": 3,
+          "pad_label": "+4.7",
+          "expected_color": "teal"
+        },
+        {
+          "slot": 4,
+          "pad_label": "GND",
+          "expected_color": "black"
+        },
+        {
+          "slot": 5,
+          "pad_label": "+5",
+          "expected_color": "red"
+        }
+      ]
+    },
+    "power_connector": {
+      "description": "Second connector on the opposite edge of the same board (2 twisted pairs). Order confirmed by user on 2026-08-19: red, black, black, yellow, red, left to right. Pad silkscreen labels not confidently read from photos (small, upside-down text) - pad_label is positional only (Pos1..Pos5), not the actual pad name. check_order is false: these wires are twisted pairs, which spiral and swap left-right position along their length by design, so strict positional order isn't physically meaningful here the way it is for the straight primary connector - color presence and count is what's actually checked. require_solder_reach is false here (unlike default): tested against a real photo and it still passed, but with noticeably thinner margins (pixel counts as low as ~2000 vs ~9000+ on the straight connector) since twisted wire drifts sideways from its joint much faster than straight wire - left off until proven reliable live, not because the idea doesn't apply.",
+      "expected_color_sequence": [
+        "red",
+        "black",
+        "black",
+        "yellow",
+        "red"
+      ],
+      "check_order": false,
+      "require_solder_reach": false,
+      "strip_position": "top",
+      "wire_slots": [
+        {
+          "slot": 1,
+          "pad_label": "Pos1",
+          "expected_color": "red"
+        },
+        {
+          "slot": 2,
+          "pad_label": "Pos2",
+          "expected_color": "black"
+        },
+        {
+          "slot": 3,
+          "pad_label": "Pos3",
+          "expected_color": "black"
+        },
+        {
+          "slot": 4,
+          "pad_label": "Pos4",
+          "expected_color": "yellow"
+        },
+        {
+          "slot": 5,
+          "pad_label": "Pos5",
+          "expected_color": "red"
+        }
+      ]
+    }
+  },
+  "hsv_color_ranges": {
+    "_comment": "Placeholder ranges (OpenCV HSV: H 0-179, S/V 0-255). MUST be recalibrated once real photos of this exact camera/lighting setup are collected (Step 3 of the plan) \u2014 these are generic starting points, not measured values.",
+    "red": [
+      [
+        [
+          0,
+          100,
+          80
+        ],
+        [
+          10,
+          255,
+          255
+        ]
+      ],
+      [
+        [
+          170,
+          100,
+          80
+        ],
+        [
+          179,
+          255,
+          255
+        ]
+      ]
+    ],
+    "orange": [
+      [
+        [
+          11,
+          100,
+          80
+        ],
+        [
+          22,
+          255,
+          255
+        ]
+      ]
+    ],
+    "yellow": [
+      [
+        [
+          23,
+          100,
+          80
+        ],
+        [
+          35,
+          255,
+          255
+        ]
+      ]
+    ],
+    "green": [
+      [
+        [
+          36,
+          60,
+          60
+        ],
+        [
+          70,
+          255,
+          255
+        ]
+      ]
+    ],
+    "teal": [
+      [
+        [
+          71,
+          60,
+          60
+        ],
+        [
+          95,
+          255,
+          255
+        ]
+      ]
+    ],
+    "blue": [
+      [
+        [
+          96,
+          60,
+          60
+        ],
+        [
+          130,
+          255,
+          255
+        ]
+      ]
+    ],
+    "purple": [
+      [
+        [
+          131,
+          60,
+          60
+        ],
+        [
+          155,
+          255,
+          255
+        ]
+      ]
+    ],
+    "black": [
+      [
+        [
+          0,
+          0,
+          0
+        ],
+        [
+          179,
+          255,
+          50
+        ]
+      ]
+    ],
+    "white": [
+      [
+        [
+          0,
+          0,
+          200
+        ],
+        [
+          179,
+          40,
+          255
+        ]
+      ]
+    ],
+    "grey": [
+      [
+        [
+          0,
+          0,
+          60
+        ],
+        [
+          179,
+          30,
+          200
+        ]
+      ]
+    ],
+    "solder": [
+      [
+        [
+          0,
+          10,
+          90
+        ],
+        [
+          40,
+          75,
+          255
+        ]
+      ]
+    ]
+  },
+  "wire_crop_regions": {
+    "_comment": "Pixel (x, y, w, h) boxes for each wire slot, defined once from held-out calibration images per Step 4. Empty until Step 3 data collection happens \u2014 code will refuse to run until these are filled in.",
+    "default": [],
+    "power_connector": []
+  },
+  "plate_color_ranges": {
+    "_comment": "HSV [lower, upper] the plate is auto-detected against in webcam auto mode. null until calibrated by pressing 'p' in scripts/webcam_live.py (samples the board's actual color under your actual lighting) \u2014 falls back to slower/flakier edge-based detection until then.",
+    "default": {
+      "lower": [
+        90.0,
+        129.0,
+        0
+      ],
+      "upper": [
+        114.0,
+        255,
+        137.0
+      ]
+    },
+    "power_connector": null
+  },
+  "grommet_color_range": {
+    "_comment": "HSV [lower, upper] for the board's 4 green mounting grommets - used by find_plate_corners_by_grommets, the primary plate detector: it finds the 4 grommets (simple, consistently circular blobs) and connects their centers, instead of tracing the board's own body color (which the grommets themselves punch corner notches into, making that contour irregular and unstable frame to frame - verified live). Calibrated on 2026-08-19 from real reference photos across multiple grommets - unlike plate_color_ranges, this doesn't need a live 'p' press: a grommet is a fixed manufactured part, not something that varies with this board's own color or lighting the way the PCB does.",
+    "lower": [35, 70, 50],
+    "upper": [60, 255, 220]
+  },
+  "confidence_thresholds": {
+    "pass_at_or_above": 0.9,
+    "fail_below": 0.4,
+    "_comment": "Between fail_below and pass_at_or_above => uncertain (yellow)."
+  }
+}

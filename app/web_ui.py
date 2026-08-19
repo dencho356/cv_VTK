@@ -1,0 +1,234 @@
+"""Browser upload UI for the wire checker (Step 6/7 groundwork).
+
+Upload a photo, get back a verdict for every harness defined in
+spec.json (currently the primary connector and the power connector),
+plus an annotated view of exactly what was detected - same pipeline as
+the live webcam tool and check_image.py, just reachable from a browser
+instead of a terminal.
+
+Run with:
+    uvicorn app.web_ui:app --reload
+
+Then open http://127.0.0.1:8000
+"""
+from __future__ import annotations
+
+import base64
+from datetime import datetime, timezone
+from pathlib import Path
+
+import cv2
+import numpy as np
+from fastapi import FastAPI, File, UploadFile
+from fastapi.responses import HTMLResponse
+
+from app.wire_checker import check_wires, load_spec
+
+app = FastAPI(title="Wire Checker")
+
+UPLOAD_DIR = Path(__file__).resolve().parent.parent / "dataset" / "incoming"
+
+UPLOAD_PAGE = """
+<!doctype html>
+<html>
+<head>
+<title>Wire Checker</title>
+<style>
+  body { font-family: -apple-system, sans-serif; max-width: 640px; margin: 60px auto; padding: 0 20px; color: #222; }
+  h1 { font-size: 1.4rem; }
+  .dropzone {
+    display: flex; flex-direction: column; align-items: center; justify-content: center;
+    width: 100%; box-sizing: border-box; min-height: 160px;
+    border: 2px dashed #999; border-radius: 12px; padding: 48px 20px;
+    text-align: center; color: #666; cursor: pointer; transition: border-color .15s, background .15s;
+  }
+  .dropzone.drag { border-color: #2a7; background: #f3fbf6; }
+  input[type=file] { display: none; }
+  button {
+    margin-top: 16px; padding: 10px 20px; font-size: 1rem; border-radius: 8px;
+    border: none; background: #2a7; color: white; cursor: pointer;
+  }
+  button:disabled { background: #aaa; cursor: default; }
+  #preview { max-width: 100%; margin-top: 16px; border-radius: 8px; display: none; }
+</style>
+</head>
+<body>
+<h1>Wire Checker</h1>
+<p>Upload a photo of the plate. Checks every harness defined in spec.json.</p>
+<form id="form" action="/check" method="post" enctype="multipart/form-data">
+  <label class="dropzone" id="dropzone">
+    <input type="file" id="file" name="file" accept="image/*">
+    <div id="dz-text">Click to choose a photo, or drag one here</div>
+    <img id="preview">
+  </label>
+  <br>
+  <button id="submit" type="submit" disabled>Check wires</button>
+</form>
+<script>
+  const fileInput = document.getElementById('file');
+  const dropzone = document.getElementById('dropzone');
+  const preview = document.getElementById('preview');
+  const dzText = document.getElementById('dz-text');
+  const submitBtn = document.getElementById('submit');
+
+  function showFile(file) {
+    if (!file) return;
+    preview.src = URL.createObjectURL(file);
+    preview.style.display = 'block';
+    dzText.textContent = file.name;
+    submitBtn.disabled = false;
+  }
+  fileInput.addEventListener('change', () => showFile(fileInput.files[0]));
+  dropzone.addEventListener('dragover', (e) => { e.preventDefault(); dropzone.classList.add('drag'); });
+  dropzone.addEventListener('dragleave', () => dropzone.classList.remove('drag'));
+  dropzone.addEventListener('drop', (e) => {
+    e.preventDefault();
+    dropzone.classList.remove('drag');
+    fileInput.files = e.dataTransfer.files;
+    showFile(fileInput.files[0]);
+  });
+  document.getElementById('form').addEventListener('submit', () => {
+    submitBtn.disabled = true;
+    submitBtn.textContent = 'Checking...';
+  });
+</script>
+</body>
+</html>
+"""
+
+
+def _encode_image(image: np.ndarray) -> str:
+    ok, buf = cv2.imencode(".jpg", image, [cv2.IMWRITE_JPEG_QUALITY, 85])
+    return base64.b64encode(buf).decode("ascii") if ok else ""
+
+
+def _draw_harness_annotations(debug: dict, wire_slots: list[dict]) -> tuple[np.ndarray, np.ndarray]:
+    """Returns (original_with_outline, warped_with_wire_boxes)."""
+    warped = debug["warped"].copy()
+    offset_y = debug["strip_offset_y"]
+    in_order = debug["in_order"]
+    check_order = debug["check_order"]
+
+    for r in debug["raw_results"]:
+        # This wire's own box is green iff it was individually found/matched -
+        # a missing or out-of-order sibling wire doesn't make THIS one wrong.
+        color_bgr = (0, 200, 0) if r["found"] else (0, 0, 220)
+        if r["found"]:
+            x, y = r["centroid"]
+            y += offset_y
+            cv2.circle(warped, (x, y), 22, color_bgr, 4)
+            order_note = " (order?)" if check_order and not in_order else ""
+            label = f"P{r['slot']} {r['expected_color']}{order_note}"
+            cv2.putText(warped, label, (x - 30, y - 30), cv2.FONT_HERSHEY_SIMPLEX, 0.6, color_bgr, 2)
+        else:
+            label = f"P{r['slot']} {r['expected_color']} MISSING"
+            cv2.putText(
+                warped, label, (10, 30 + 25 * r["slot"]), cv2.FONT_HERSHEY_SIMPLEX, 0.55, color_bgr, 2
+            )
+    return warped
+
+
+@app.get("/", response_class=HTMLResponse)
+def index() -> str:
+    return UPLOAD_PAGE
+
+
+@app.post("/check", response_class=HTMLResponse)
+async def check(file: UploadFile = File(...)) -> str:
+    contents = await file.read()
+    suffix = Path(file.filename or "upload.jpg").suffix or ".jpg"
+
+    # Saved persistently (not a temp file that gets deleted after the
+    # request) into dataset/incoming - the folder the original plan
+    # designated for "where a new photo would land". This doubles as the
+    # traceability record and means a failure can actually be inspected
+    # afterward instead of being lost the moment the response is sent.
+    UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
+    timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%f")
+    tmp_path = str(UPLOAD_DIR / f"{timestamp}{suffix}")
+    with open(tmp_path, "wb") as f:
+        f.write(contents)
+
+    spec = load_spec()
+    sections = []
+    original_outline_img: np.ndarray | None = None
+
+    for harness_type, harness in spec["harness_types"].items():
+        if not harness.get("wire_slots"):
+            continue
+
+        result, debug = check_wires(tmp_path, harness_type=harness_type, return_debug=True)
+
+        if debug.get("corners") is None:
+            sections.append(
+                f"""
+                <div class="harness fail">
+                  <h2>{harness_type}</h2>
+                  <p class="verdict">Could not detect the plate.</p>
+                </div>
+                """
+            )
+            continue
+
+        if original_outline_img is None:
+            original_outline_img = cv2.imread(tmp_path)
+
+        corners = debug["corners"]
+        cv2.polylines(original_outline_img, [corners.astype(np.int32)], True, (255, 200, 0), 4)
+
+        strip_img = _draw_harness_annotations(debug, harness["wire_slots"])
+        strip_b64 = _encode_image(strip_img)
+
+        wire_rows = "".join(
+            f"""<tr class="{'pass' if w['pass'] else 'fail'}">
+                  <td>{w['pad_label']}</td><td>{w['expected_color']}</td>
+                  <td>{w['detected_color']}</td><td>{'PASS' if w['pass'] else 'FAIL'}</td>
+                </tr>"""
+            for w in result["wires"]
+        )
+        verdict = "GOOD" if result["pass"] else "CHECK WIRES"
+        css_class = "pass" if result["pass"] else "fail"
+
+        sections.append(
+            f"""
+            <div class="harness {css_class}">
+              <h2>{harness_type}</h2>
+              <p class="verdict">{verdict}</p>
+              <img src="data:image/jpeg;base64,{strip_b64}">
+              <table>
+                <tr><th>Pad</th><th>Expected</th><th>Detected</th><th></th></tr>
+                {wire_rows}
+              </table>
+            </div>
+            """
+        )
+
+    original_b64 = _encode_image(original_outline_img) if original_outline_img is not None else ""
+
+    return f"""
+    <!doctype html>
+    <html>
+    <head>
+    <title>Wire Checker - Result</title>
+    <style>
+      body {{ font-family: -apple-system, sans-serif; max-width: 720px; margin: 40px auto; padding: 0 20px; color: #222; }}
+      a {{ color: #2a7; }}
+      .harness {{ border-radius: 10px; padding: 16px; margin: 16px 0; border: 2px solid #ddd; }}
+      .harness.pass {{ border-color: #2a7; background: #f3fbf6; }}
+      .harness.fail {{ border-color: #d33; background: #fdf3f3; }}
+      .verdict {{ font-size: 1.3rem; font-weight: bold; }}
+      .harness.pass .verdict {{ color: #2a7; }}
+      .harness.fail .verdict {{ color: #d33; }}
+      img {{ max-width: 100%; border-radius: 8px; margin: 8px 0; }}
+      table {{ width: 100%; border-collapse: collapse; margin-top: 8px; }}
+      td, th {{ padding: 6px 8px; text-align: left; border-bottom: 1px solid #eee; }}
+      tr.fail td {{ color: #d33; }}
+    </style>
+    </head>
+    <body>
+    <p><a href="/">&larr; upload another photo</a></p>
+    {'<img src="data:image/jpeg;base64,' + original_b64 + '">' if original_b64 else ''}
+    {''.join(sections)}
+    </body>
+    </html>
+    """

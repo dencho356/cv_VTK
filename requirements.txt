@@ -1,0 +1,7 @@
+opencv-python
+numpy
+scikit-learn
+fastapi
+uvicorn[standard]
+python-multipart
+# anomalib   # uncomment once starting Step 5 (solder anomaly detection) - heavy dependency (torch)
