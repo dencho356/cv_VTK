@@ -22,6 +22,7 @@ import numpy as np
 from fastapi import FastAPI, File, UploadFile
 from fastapi.responses import HTMLResponse
 
+from app.solder_checker import count_solder_joints
 from app.wire_checker import check_wires, load_spec
 
 app = FastAPI(title="Wire Checker")
@@ -128,6 +129,33 @@ def _draw_harness_annotations(debug: dict, wire_slots: list[dict]) -> tuple[np.n
     return warped
 
 
+def _draw_solder_blob_annotations(original_image: np.ndarray, joint_result: dict) -> np.ndarray | None:
+    """Circle each detected solder joint on the original photo, then crop
+    to a padded bounding box around just the found joints - count_solder_
+    joints returns coordinates in the original image's own resolution
+    (see its docstring for why: each joint is found in a small window
+    anchored to its own wire, not one shared rectified/resized crop), so
+    circles are drawn directly at those coordinates, no offset math
+    needed. Returns None if no joints were found (nothing to usefully
+    crop to)."""
+    joints = joint_result["joints"]
+    if not joints:
+        return None
+
+    out = original_image.copy()
+    for i, j in enumerate(joints, 1):
+        cv2.circle(out, (j["x"], j["y"]), 90, (0, 255, 0), 6)
+        cv2.putText(out, str(i), (j["x"] - 15, j["y"] + 10), cv2.FONT_HERSHEY_SIMPLEX, 1.1, (0, 0, 220), 3)
+
+    pad = 160
+    xs = [j["x"] for j in joints]
+    ys = [j["y"] for j in joints]
+    h, w = out.shape[:2]
+    x0, x1 = max(0, min(xs) - pad), min(w, max(xs) + pad)
+    y0, y1 = max(0, min(ys) - pad), min(h, max(ys) + pad)
+    return out[y0:y1, x0:x1]
+
+
 @app.get("/", response_class=HTMLResponse)
 def index() -> str:
     return UPLOAD_PAGE
@@ -189,6 +217,25 @@ async def check(file: UploadFile = File(...)) -> str:
         verdict = "GOOD" if result["pass"] else "CHECK WIRES"
         css_class = "pass" if result["pass"] else "fail"
 
+        # Solder-joint circling: a separate capability from the wire-color
+        # check above (detects joints by their specular highlight, not by
+        # color - see app/solder_checker.py) - shown as long as the plate
+        # was found, independent of whether the wire-color check passed.
+        joint_section = ""
+        try:
+            joint_result = count_solder_joints(tmp_path, harness_type=harness_type)
+            joint_img = _draw_solder_blob_annotations(original_outline_img, joint_result)
+            if joint_img is not None:
+                joint_b64 = _encode_image(joint_img)
+                joint_section = f"""
+                <p><strong>{joint_result['count']} solder joint(s) detected</strong> (of {len(result['wires'])} wires found)</p>
+                <img src="data:image/jpeg;base64,{joint_b64}">
+                """
+            else:
+                joint_section = "<p><em>No solder joints detected near the found wires.</em></p>"
+        except Exception as exc:  # noqa: BLE001 - a joint-circling failure shouldn't hide the wire result
+            joint_section = f"<p><em>Solder joint detection failed: {exc}</em></p>"
+
         sections.append(
             f"""
             <div class="harness {css_class}">
@@ -199,6 +246,7 @@ async def check(file: UploadFile = File(...)) -> str:
                 <tr><th>Pad</th><th>Expected</th><th>Detected</th><th></th></tr>
                 {wire_rows}
               </table>
+              {joint_section}
             </div>
             """
         )

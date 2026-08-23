@@ -11,6 +11,9 @@
       ],
       "check_order": true,
       "require_solder_reach": false,
+      "check_wire_count": false,
+      "expected_wire_strand_count": 3,
+      "_expected_wire_strand_count_comment": "count_wire_strands_at_row (app/plate_detector.py) is a color-independent physical wire count, meant to catch an extra/wrong-colored wire that per-slot color matching would silently miss - but this harness's wires are dressed close enough together that they visibly cross within the photographed margin (verified against dataset/incoming 20260819T144047849976.jpeg), so no margin/row gave an exact 5-of-5 count. 3 is what the algorithm itself consistently returns for a real, correctly-wired 5-wire photo (calibrated across 5 of the 8 real photos in dataset/incoming on 2026-08-19) - it's a baseline for THIS algorithm's own output, not a literal wire tally. check_wire_count is off until validated live (see require_solder_reach's history in this same file - a static-photo pass here is not a live-camera guarantee).",
       "strip_position": "bottom",
       "wire_slots": [
         {
@@ -51,6 +54,9 @@
       ],
       "check_order": false,
       "require_solder_reach": false,
+      "check_wire_count": false,
+      "expected_wire_strand_count": 5,
+      "_expected_wire_strand_count_comment": "Unlike the default harness, this one's wires separate cleanly enough for count_wire_strands_at_row to hit an EXACT match against the real wire count (5) on 6 of the 8 real photos in dataset/incoming (2026-08-19) - the other 2 are a different, 6-wire board and correctly land on a mismatch (9, not 5; the raw number isn't meaningful, only the mismatch is). Still off by default pending live validation (see require_solder_reach's history in this file).",
       "strip_position": "top",
       "wire_slots": [
         {
@@ -269,6 +275,11 @@
         137.0
       ]
     },
+    "power_connector": null
+  },
+  "background_color_ranges": {
+    "_comment": "HSV [lower, upper] for the table/mat behind the wires in the strip, used by count_wire_strands_at_row to segment wires from background without needing to know each wire's color. null until calibrated (see sample_background_color in app/plate_detector.py) - falls back to a live per-frame estimate from the strip's own 4 corners until then, same fallback pattern as plate detection.",
+    "default": null,
     "power_connector": null
   },
   "grommet_color_range": {

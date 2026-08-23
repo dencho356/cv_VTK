@@ -45,6 +45,9 @@ def inspect_image(image_path: str, unit_id: str, harness_type: str = "default") 
             for w in wire_result.get("wires", [])
             if not w["pass"]
         )
+        wire_count = wire_result.get("wire_count")
+        if wire_count and wire_count["enforced"] and not wire_count["match"]:
+            defects.append(f"wire count mismatch: found {wire_count['found']}, expected {wire_count['expected']}")
 
     solder_result = check_solder(image_path)
     if solder_result.get("status") == "untrained":

@@ -128,6 +128,137 @@ def sample_plate_color(
     return lower, upper, median.tolist()
 
 
+def sample_background_color(
+    strip_bgr: np.ndarray, far_edge: str = "bottom", patch_half: int = 12
+) -> tuple[list[float], list[float], list[float]]:
+    """Median HSV of the strip's two corners on far_edge, for calibrating
+    count_wire_strands_at_row against this specific table/mat under this
+    specific lighting - mirrors sample_plate_color. far_edge must be the
+    strip edge AWAY from the board seam (i.e. the same edge count_wire_
+    strands_at_row's row_fractions lean toward), not both edges: verified
+    against a real photo (dataset/incoming 20260819T144047849976.jpeg)
+    where rectify_plate's board/margin split isn't pixel-perfect and a
+    sliver of the actual board (with a grommet) leaked into the strip's
+    near-seam edge, so sampling that edge's corners as "background"
+    picked up board-blue instead and wrecked every count on that photo.
+    The far edge doesn't have this problem since the board never bleeds
+    that far past its own boundary. Returns (lower, upper, raw_median) -
+    same reasoning as sample_plate_color for exposing the raw sample: a
+    corner that actually had a wire (or leaked board) in it would silently
+    produce a bad calibration otherwise."""
+    h, w = strip_bgr.shape[:2]
+    hsv = cv2.cvtColor(strip_bgr, cv2.COLOR_BGR2HSV)
+    side = patch_half * 2
+    if far_edge == "bottom":
+        row = hsv[max(0, h - side) : h, :]
+    else:
+        row = hsv[0:side, :]
+    patches = [row[:, 0:side], row[:, max(0, w - side) : w]]
+    samples = np.concatenate([p.reshape(-1, 3) for p in patches if p.size], axis=0)
+    median = np.median(samples, axis=0)
+    h_med, s_med, v_med = median
+    # V is deliberately given almost no tolerance restriction (0-255): a
+    # wire casts a visible shadow on the table right next to it, and that
+    # shadowed table pixel is still the table's own hue/saturation, just
+    # darker - verified against a real photo where a tight V window
+    # classified that shadow as foreground instead of background, bridging
+    # two separate wires into one run. H/S stay tight since those are what
+    # actually distinguish table from a colored wire.
+    lower = [max(0, h_med - 12), max(0, s_med - 25), 0]
+    upper = [min(179, h_med + 12), min(255, s_med + 25), 255]
+    return lower, upper, median.tolist()
+
+
+def count_wire_strands_at_row(
+    strip_bgr: np.ndarray,
+    background_hsv_range: tuple[list[float], list[float]] | None = None,
+    exclude_hsv_range: tuple[list[float], list[float]] | None = None,
+    exclude_near_edge: str = "top",
+    exclude_near_edge_fraction: float = 0.3,
+    row_fractions: tuple[float, ...] = (0.55, 0.65, 0.75, 0.85, 0.95),
+    min_run_px: int = 12,
+    gap_merge_px: int = 6,
+) -> list[tuple[int, int]]:
+    """Count physical wire strands in a strip by foreground/background
+    segmentation, independent of wire color - unlike find_wire_slots_by_color,
+    this doesn't need a wire's color to be one of the known buckets in
+    hsv_color_ranges, so it also catches a wire in a color the spec never
+    listed (verified against a real photo with an unlisted white wire that
+    find_wire_slots_by_color silently ignored) and an extra wire that
+    happens to coincidentally match an already-expected color (which
+    per-color matching can't distinguish from "correct count, right
+    colors" at all, since it never counts, only searches for each expected
+    color independently).
+
+    Sampled at several rows in the strip's outer half rather than the
+    board seam: verified against a real photo (dataset/incoming
+    20260819T150049822942.jpeg) that wires bundled at the seam are packed
+    tightly enough to merge into one blob there, and can still cross each
+    other briefly further out (two wires visibly crossed around 60% of the
+    strip's height in that same photo) - a single fixed row is vulnerable
+    to undercounting at exactly the row a crossing happens to fall on, so
+    every candidate row is tried and the row with the MOST runs found is
+    kept (a momentary crossing loses runs; picking the max is the correct
+    direction to bias toward when the failure mode is undercounting, not
+    over-fragmenting, since gap_merge_px already collapses split runs from
+    a thin anti-aliased seam within one wire).
+
+    background_hsv_range (from sample_background_color, if calibrated) is
+    used as the background color to threshold OUT and away; when not
+    given, it's estimated fresh per-frame from this strip's own four
+    corners (see sample_background_color) - a live per-frame fallback, not
+    just a startup default, since the actual background (table, hand,
+    mat) can change between shots the way the plate's own color can't.
+
+    Returns the best row's list of (x_start, x_end) column runs, sorted
+    left to right - the caller compares len(...) against the number of
+    expected wire_slots.
+    """
+    h, w = strip_bgr.shape[:2]
+    hsv = cv2.cvtColor(strip_bgr, cv2.COLOR_BGR2HSV)
+
+    if background_hsv_range is not None:
+        bg_lower, bg_upper = background_hsv_range
+    else:
+        far_edge = "top" if exclude_near_edge == "bottom" else "bottom"
+        bg_lower, bg_upper, _ = sample_background_color(strip_bgr, far_edge=far_edge)
+
+    background_mask = cv2.inRange(hsv, np.array(bg_lower), np.array(bg_upper))
+    foreground_mask = cv2.bitwise_not(background_mask)
+
+    if exclude_hsv_range is not None:
+        exclude_lower, exclude_upper = exclude_hsv_range
+        raw_exclude_mask = cv2.inRange(hsv, np.array(exclude_lower), np.array(exclude_upper))
+        exclude_mask = _mask_near_edge(raw_exclude_mask, exclude_near_edge, exclude_near_edge_fraction)
+        foreground_mask &= cv2.bitwise_not(exclude_mask)
+
+    foreground_mask = cv2.morphologyEx(foreground_mask, cv2.MORPH_OPEN, np.ones((3, 3), np.uint8))
+
+    def runs_in_row(row_mask: np.ndarray) -> list[tuple[int, int]]:
+        cols = np.where(row_mask > 0)[0]
+        if len(cols) == 0:
+            return []
+        runs = []
+        start = prev = cols[0]
+        for c in cols[1:]:
+            if c - prev > gap_merge_px:
+                runs.append((start, prev))
+                start = c
+            prev = c
+        runs.append((start, prev))
+        return [r for r in runs if r[1] - r[0] >= min_run_px]
+
+    best_runs: list[tuple[int, int]] = []
+    for frac in row_fractions:
+        y = min(h - 1, max(0, int(h * frac)))
+        row_mask = foreground_mask[max(0, y - 2) : y + 3, :].max(axis=0)
+        runs = runs_in_row(row_mask)
+        if len(runs) > len(best_runs):
+            best_runs = runs
+
+    return best_runs
+
+
 def find_plate_corners_by_color(
     frame: np.ndarray,
     hsv_lower: list[float],
@@ -290,6 +421,69 @@ def rectify_plate(
     warped = cv2.warpPerspective(frame, transform, (board_px, total_px), borderMode=cv2.BORDER_REPLICATE)
     inverse_transform = np.linalg.inv(transform)
     return warped, inverse_transform, top_margin_px, board_px, bottom_margin_px
+
+
+def detect_solder_blobs(
+    region_bgr: np.ndarray,
+    highlight_v_threshold: int = 248,
+    close_kernel_px: int = 41,
+    min_area_px: int = 400,
+    max_area_px: int = 9000,
+    max_aspect_ratio: float = 2.2,
+) -> list[dict]:
+    """Find solder joints by their specular highlight, not their color.
+    Verified against real photos that a curved, reflowed solder dome
+    produces a small patch of genuinely blown-out brightness (V=255,
+    pure white) that a flat gold pad or a via hole never reaches under
+    the same lighting (pads/holes topped out at V=186-230 in every real
+    sample checked) - so thresholding on "did this pixel hit the sensor's
+    ceiling" separates real joints from pads/holes far more reliably than
+    any solder color range did (see spec.json's hsv_color_ranges.solder,
+    which matches gold pads, not domes, on real photos).
+
+    close_kernel_px merges each dome's highlight fragment (rarely one
+    solid blob - usually a bright core plus scattered flecks) into one
+    component per dome; min_area_px drops sensor noise. max_area_px
+    rejects anything far bigger than a real dome - verified against a
+    real photo that a metal connector shield (e.g. USB-C) elsewhere in
+    frame also blows out to pure white but spans a much larger area than
+    any single dome, and without this bound it silently got counted as a
+    "joint". max_aspect_ratio rejects thin slivers - verified against a
+    real photo that a sliver of an ADJACENT pad, cut off at a search
+    window's edge, produces a tall/thin highlight run (e.g. 27x163px)
+    that passes the area bounds but is nothing like a dome's roughly
+    round/oval footprint. Requires a close-up, well-lit, in-focus photo -
+    verified this signal disappears once downscaled to the ~500px
+    board_px the rest of the pipeline uses for wire-color matching, so
+    this is meant for a dedicated joint photo, not the same frame used
+    for wire-color/order checking.
+
+    Returns one dict per detected blob: {centroid: (x, y), area, bbox},
+    sorted left to right.
+    """
+    hsv = cv2.cvtColor(region_bgr, cv2.COLOR_BGR2HSV)
+    highlight = (hsv[:, :, 2] >= highlight_v_threshold).astype(np.uint8) * 255
+    highlight = cv2.morphologyEx(highlight, cv2.MORPH_CLOSE, np.ones((close_kernel_px, close_kernel_px), np.uint8))
+    highlight = cv2.morphologyEx(highlight, cv2.MORPH_OPEN, np.ones((5, 5), np.uint8))
+
+    num_labels, _labels, stats, centroids = cv2.connectedComponentsWithStats(highlight, connectivity=8)
+    blobs = []
+    for i in range(1, num_labels):
+        area = int(stats[i, cv2.CC_STAT_AREA])
+        if not (min_area_px <= area <= max_area_px):
+            continue
+        w, h = int(stats[i, cv2.CC_STAT_WIDTH]), int(stats[i, cv2.CC_STAT_HEIGHT])
+        if max(w, h) / max(1, min(w, h)) > max_aspect_ratio:
+            continue
+        blobs.append(
+            {
+                "centroid": (int(centroids[i][0]), int(centroids[i][1])),
+                "area": area,
+                "bbox": (int(stats[i, cv2.CC_STAT_LEFT]), int(stats[i, cv2.CC_STAT_TOP]), w, h),
+            }
+        )
+    blobs.sort(key=lambda b: b["centroid"][0])
+    return blobs
 
 
 def locate_color_cluster_x_range(

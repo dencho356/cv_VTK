@@ -17,6 +17,7 @@ import cv2
 import numpy as np
 
 from app.plate_detector import (
+    count_wire_strands_at_row,
     evaluate_wire_results,
     find_plate_corners,
     find_plate_corners_by_color,
@@ -30,6 +31,29 @@ SPEC_PATH = Path(__file__).resolve().parent.parent / "spec.json"
 
 BOTTOM_MARGIN_FRACTION = 0.18
 TOP_MARGIN_FRACTION = 0.4
+
+# Used only for count_wire_strands_at_row, not color matching: verified
+# against real photos that BOTTOM_MARGIN_FRACTION's 90px-tall strip wasn't
+# enough room for two tightly-dressed neighboring wires to visually
+# separate at all - they were still touching for the strip's entire
+# height, which no color threshold can split. A taller re-warp gives the
+# count check more of each wire's length to work with, further from the
+# crowded solder line, without touching the smaller strip that
+# find_wire_slots_by_color was tuned against.
+#
+# These two values were swept against all 8 real photos in
+# dataset/incoming (2026-08-19) and picked for what they actually
+# produced, not a theoretical ideal - wires that are physically dressed
+# close together can still cross within the margin at some fractions,
+# which undercounts. At COUNT_TOP_MARGIN_FRACTION=0.4 the power_connector
+# harness's wires happen to separate cleanly enough for an exact count
+# match (5 found = 5 expected) on 6/8 photos, with the other 2 (a
+# different, 6-wire board) correctly landing on a mismatch. The default
+# harness's wires never fully separate at any margin tried - see
+# expected_wire_strand_count in spec.json for why its check compares
+# against a calibrated baseline instead of the raw slot count.
+COUNT_BOTTOM_MARGIN_FRACTION = 0.22
+COUNT_TOP_MARGIN_FRACTION = 0.4
 
 
 def load_spec() -> dict[str, Any]:
@@ -101,7 +125,7 @@ def check_wires(
         return (result, {"corners": None}) if return_debug else result
 
     strip_position = harness.get("strip_position", "bottom")
-    warped, _, top_margin_px, board_px, _bottom_margin_px = rectify_plate(
+    warped, inverse_transform, top_margin_px, board_px, _bottom_margin_px = rectify_plate(
         image,
         corners,
         board_px=500,
@@ -137,6 +161,42 @@ def check_wires(
     found_centroids_x = [r["centroid"][0] for r in results if r["found"]]
     in_order = is_monotonic(found_centroids_x)
 
+    count_warped, _, count_top_margin_px, count_board_px, _count_bottom_margin_px = rectify_plate(
+        image,
+        corners,
+        board_px=500,
+        top_margin_fraction=COUNT_TOP_MARGIN_FRACTION,
+        bottom_margin_fraction=COUNT_BOTTOM_MARGIN_FRACTION,
+    )
+    count_strip = (
+        count_warped[:count_top_margin_px, :]
+        if strip_position == "top"
+        else count_warped[count_top_margin_px + count_board_px :, :]
+    )
+
+    background_color = spec.get("background_color_ranges", {}).get(harness_type) or spec.get(
+        "background_color_ranges", {}
+    ).get("default")
+    background_range = (background_color["lower"], background_color["upper"]) if background_color else None
+    strand_runs = count_wire_strands_at_row(
+        count_strip,
+        background_hsv_range=background_range,
+        exclude_hsv_range=exclude_range,
+        exclude_near_edge=exclude_edge,
+    )
+    # expected_wire_strand_count (a calibrated baseline for what
+    # count_wire_strands_at_row itself tends to return for this harness -
+    # see spec.json) rather than len(wire_slots): touching/crossing wires
+    # make an exact physical tally unreliable for some harnesses, verified
+    # against real photos, so the count is compared against its own
+    # calibrated baseline rather than assumed to equal the slot count.
+    expected_wire_count = harness.get("expected_wire_strand_count", len(wire_slots))
+    found_wire_count = len(strand_runs)
+    wire_count_match = found_wire_count == expected_wire_count
+    check_wire_count = harness.get("check_wire_count", False)
+    if check_wire_count and not wire_count_match:
+        overall_pass = False
+
     per_wire_results = []
     for r in results:
         # A wire's own pass/fail reflects whether it was found matching its
@@ -166,6 +226,12 @@ def check_wires(
         "pass": overall_pass,
         "confidence": round(overall_confidence, 3),
         "wires": per_wire_results,
+        "wire_count": {
+            "expected": expected_wire_count,
+            "found": found_wire_count,
+            "match": wire_count_match,
+            "enforced": check_wire_count,
+        },
     }
     if not return_debug:
         return result
@@ -174,9 +240,11 @@ def check_wires(
     debug = {
         "corners": corners,
         "warped": warped,
+        "inverse_transform": inverse_transform,
         "strip_offset_y": strip_offset_y,
         "raw_results": results,
         "in_order": in_order,
         "check_order": check_order,
+        "strand_runs": strand_runs,
     }
     return result, debug
