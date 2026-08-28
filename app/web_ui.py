@@ -22,6 +22,7 @@ import numpy as np
 from fastapi import FastAPI, File, UploadFile
 from fastapi.responses import HTMLResponse
 
+from app.harness_photo import check_harness_photo, count_harness_solder_joints
 from app.solder_checker import count_solder_joints
 from app.solder_quality import assess_joint_quality
 from app.wire_checker import check_wires, load_spec
@@ -57,6 +58,7 @@ UPLOAD_PAGE = """
 <body>
 <h1>Wire Checker</h1>
 <p>Upload a photo of the plate. Checks every harness defined in spec.json.</p>
+<p><a href="/check-two">&rarr; Have separate upper/bottom close-up photos instead of one whole-plate photo?</a></p>
 <p><a href="/grade-joint">&rarr; Grade a single joint's solder quality instead (close-up photo)</a></p>
 <form id="form" action="/check" method="post" enctype="multipart/form-data">
   <label class="dropzone" id="dropzone">
@@ -171,6 +173,101 @@ wire checker for finding/counting joints on those).</p>
 """
 
 
+TWO_PHOTO_UPLOAD_PAGE = """
+<!doctype html>
+<html>
+<head>
+<title>Wire Checker - Upper/Bottom Photos</title>
+<style>
+  body { font-family: -apple-system, sans-serif; max-width: 640px; margin: 60px auto; padding: 0 20px; color: #222; }
+  h1 { font-size: 1.4rem; }
+  .dropzone {
+    display: flex; flex-direction: column; align-items: center; justify-content: center;
+    width: 100%; box-sizing: border-box; min-height: 140px;
+    border: 2px dashed #999; border-radius: 12px; padding: 32px 20px;
+    text-align: center; color: #666; cursor: pointer; transition: border-color .15s, background .15s;
+    margin-bottom: 16px;
+  }
+  .dropzone.drag { border-color: #2a7; background: #f3fbf6; }
+  input[type=file] { display: none; }
+  button {
+    margin-top: 16px; padding: 10px 20px; font-size: 1rem; border-radius: 8px;
+    border: none; background: #2a7; color: white; cursor: pointer;
+  }
+  button:disabled { background: #aaa; cursor: default; }
+  img.preview { max-width: 100%; margin-top: 12px; border-radius: 8px; display: none; }
+  label.title { display: block; font-weight: bold; margin-bottom: 6px; }
+</style>
+</head>
+<body>
+<p><a href="/">&larr; back to single whole-plate photo checker</a></p>
+<h1>Wire Checker - Upper / Bottom Photos</h1>
+<p>Upload two dedicated close-up photos - one of the connector whose wires exit
+<strong>upward</strong> (checked against the <code>power_connector</code> harness), one of the
+connector whose wires hang <strong>downward</strong> (checked against the <code>default</code> harness).
+Each photo should show that connector's wires and solder joints, with just a sliver of board at
+the seam - no full-plate framing or grommets needed.</p>
+<form id="form" action="/check-two" method="post" enctype="multipart/form-data">
+  <label class="title">Upper photo (power_connector)</label>
+  <label class="dropzone" id="dz-upper">
+    <input type="file" id="file-upper" name="upper_file" accept="image/*">
+    <div id="dz-upper-text">Click to choose a photo, or drag one here</div>
+    <img class="preview" id="preview-upper">
+  </label>
+
+  <label class="title">Bottom photo (default)</label>
+  <label class="dropzone" id="dz-bottom">
+    <input type="file" id="file-bottom" name="bottom_file" accept="image/*">
+    <div id="dz-bottom-text">Click to choose a photo, or drag one here</div>
+    <img class="preview" id="preview-bottom">
+  </label>
+
+  <button id="submit" type="submit" disabled>Check wires</button>
+</form>
+<script>
+  function wireDropzone(prefix, inputId) {
+    const fileInput = document.getElementById(inputId);
+    const dropzone = document.getElementById('dz-' + prefix);
+    const preview = document.getElementById('preview-' + prefix);
+    const dzText = document.getElementById('dz-' + prefix + '-text');
+
+    function showFile(file) {
+      if (!file) return;
+      preview.src = URL.createObjectURL(file);
+      preview.style.display = 'block';
+      dzText.textContent = file.name;
+      maybeEnableSubmit();
+    }
+    fileInput.addEventListener('change', () => showFile(fileInput.files[0]));
+    dropzone.addEventListener('dragover', (e) => { e.preventDefault(); dropzone.classList.add('drag'); });
+    dropzone.addEventListener('dragleave', () => dropzone.classList.remove('drag'));
+    dropzone.addEventListener('drop', (e) => {
+      e.preventDefault();
+      dropzone.classList.remove('drag');
+      fileInput.files = e.dataTransfer.files;
+      showFile(fileInput.files[0]);
+    });
+  }
+
+  function maybeEnableSubmit() {
+    const upper = document.getElementById('file-upper').files.length > 0;
+    const bottom = document.getElementById('file-bottom').files.length > 0;
+    document.getElementById('submit').disabled = !(upper && bottom);
+  }
+
+  wireDropzone('upper', 'file-upper');
+  wireDropzone('bottom', 'file-bottom');
+
+  document.getElementById('form').addEventListener('submit', () => {
+    document.getElementById('submit').disabled = true;
+    document.getElementById('submit').textContent = 'Checking...';
+  });
+</script>
+</body>
+</html>
+"""
+
+
 def _encode_image(image: np.ndarray) -> str:
     ok, buf = cv2.imencode(".jpg", image, [cv2.IMWRITE_JPEG_QUALITY, 85])
     return base64.b64encode(buf).decode("ascii") if ok else ""
@@ -229,9 +326,137 @@ def _draw_solder_blob_annotations(original_image: np.ndarray, joint_result: dict
     return out[y0:y1, x0:x1]
 
 
+def _draw_harness_photo_annotations(image: np.ndarray, raw_results: list[dict], in_order: bool, check_order: bool) -> np.ndarray:
+    """Same per-wire green/red circling as _draw_harness_annotations, but
+    drawn directly on the dedicated photo's own pixel coordinates - there's
+    no separately rectified "warped" image or offset_y to account for
+    here (see app/harness_photo.py)."""
+    out = image.copy()
+    for r in raw_results:
+        color_bgr = (0, 200, 0) if r["found"] else (0, 0, 220)
+        if r["found"]:
+            x, y = r["centroid"]
+            cv2.circle(out, (x, y), 22, color_bgr, 4)
+            order_note = " (order?)" if check_order and not in_order else ""
+            label = f"P{r['slot']} {r['expected_color']}{order_note}"
+            cv2.putText(out, label, (x - 30, max(y - 30, 20)), cv2.FONT_HERSHEY_SIMPLEX, 0.6, color_bgr, 2)
+        else:
+            label = f"P{r['slot']} {r['expected_color']} MISSING"
+            cv2.putText(out, label, (10, 30 + 25 * r["slot"]), cv2.FONT_HERSHEY_SIMPLEX, 0.55, color_bgr, 2)
+    return out
+
+
 @app.get("/", response_class=HTMLResponse)
 def index() -> str:
     return UPLOAD_PAGE
+
+
+@app.get("/check-two", response_class=HTMLResponse)
+def check_two_form() -> str:
+    return TWO_PHOTO_UPLOAD_PAGE
+
+
+@app.post("/check-two", response_class=HTMLResponse)
+async def check_two(upper_file: UploadFile = File(...), bottom_file: UploadFile = File(...)) -> str:
+    UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
+    timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%f")
+
+    paths = {}
+    for label, upload in (("upper", upper_file), ("bottom", bottom_file)):
+        contents = await upload.read()
+        suffix = Path(upload.filename or f"{label}.jpg").suffix or ".jpg"
+        path = str(UPLOAD_DIR / f"{timestamp}_{label}{suffix}")
+        with open(path, "wb") as f:
+            f.write(contents)
+        paths[label] = path
+
+    spec = load_spec()
+    harness_for_label = {"upper": "power_connector", "bottom": "default"}
+    sections = []
+
+    for label in ("upper", "bottom"):
+        harness_type = harness_for_label[label]
+        harness = spec["harness_types"].get(harness_type, {})
+        path = paths[label]
+
+        try:
+            result, debug = check_harness_photo(path, harness_type=harness_type, return_debug=True)
+        except (FileNotFoundError, ValueError) as exc:
+            sections.append(
+                f"""
+                <div class="harness fail">
+                  <h2>{label} ({harness_type})</h2>
+                  <p class="verdict">Could not process this photo: {exc}</p>
+                </div>
+                """
+            )
+            continue
+
+        image = cv2.imread(path)
+        annotated = _draw_harness_photo_annotations(image, debug["raw_results"], debug["in_order"], debug["check_order"])
+
+        try:
+            joint_result = count_harness_solder_joints(path, harness_type=harness_type)
+            joint_img = _draw_solder_blob_annotations(annotated, joint_result)
+            if joint_img is not None:
+                annotated = joint_img
+            joint_note = f"<p><strong>{joint_result['count']} solder joint(s) detected</strong> (of {len(result['wires'])} wires found)</p>"
+        except Exception as exc:  # noqa: BLE001 - a joint-circling failure shouldn't hide the wire result
+            joint_note = f"<p><em>Solder joint detection failed: {exc}</em></p>"
+
+        img_b64 = _encode_image(annotated)
+
+        wire_rows = "".join(
+            f"""<tr class="{'pass' if w['pass'] else 'fail'}">
+                  <td>{w['pad_label']}</td><td>{w['expected_color']}</td>
+                  <td>{w['detected_color']}</td><td>{'PASS' if w['pass'] else 'FAIL'}</td>
+                </tr>"""
+            for w in result["wires"]
+        )
+        verdict = "GOOD" if result["pass"] else "CHECK WIRES"
+        css_class = "pass" if result["pass"] else "fail"
+
+        sections.append(
+            f"""
+            <div class="harness {css_class}">
+              <h2>{label} ({harness_type})</h2>
+              <p class="verdict">{verdict}</p>
+              <img src="data:image/jpeg;base64,{img_b64}">
+              <table>
+                <tr><th>Pad</th><th>Expected</th><th>Detected</th><th></th></tr>
+                {wire_rows}
+              </table>
+              {joint_note}
+            </div>
+            """
+        )
+
+    return f"""
+    <!doctype html>
+    <html>
+    <head>
+    <title>Wire Checker - Result</title>
+    <style>
+      body {{ font-family: -apple-system, sans-serif; max-width: 720px; margin: 40px auto; padding: 0 20px; color: #222; }}
+      a {{ color: #2a7; }}
+      .harness {{ border-radius: 10px; padding: 16px; margin: 16px 0; border: 2px solid #ddd; }}
+      .harness.pass {{ border-color: #2a7; background: #f3fbf6; }}
+      .harness.fail {{ border-color: #d33; background: #fdf3f3; }}
+      .verdict {{ font-size: 1.3rem; font-weight: bold; }}
+      .harness.pass .verdict {{ color: #2a7; }}
+      .harness.fail .verdict {{ color: #d33; }}
+      img {{ max-width: 100%; border-radius: 8px; margin: 8px 0; }}
+      table {{ width: 100%; border-collapse: collapse; margin-top: 8px; }}
+      td, th {{ padding: 6px 8px; text-align: left; border-bottom: 1px solid #eee; }}
+      tr.fail td {{ color: #d33; }}
+    </style>
+    </head>
+    <body>
+    <p><a href="/check-two">&larr; upload another pair of photos</a></p>
+    {''.join(sections)}
+    </body>
+    </html>
+    """
 
 
 @app.post("/check", response_class=HTMLResponse)

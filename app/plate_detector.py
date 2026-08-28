@@ -123,8 +123,12 @@ def sample_plate_color(
     # noticeably less saturated than a glossy PCB, so this is the strongest
     # single lever against matching them, without hard-coding an absolute
     # threshold that could reject a legitimately duller board.
-    lower = [max(0, h_med - 10), max(0, s_med - 40, s_med * 0.6), max(0, v_med - 50)]
-    upper = [min(179, h_med + 10), min(255, s_med + 40), min(255, v_med + 50)]
+    # See sample_background_color's matching comment: every element is
+    # explicitly cast to float so a clipped bound (0, 179, 255) can't
+    # silently leave lower/upper with different dtypes once passed
+    # through np.array(), which cv2.inRange rejects outright.
+    lower = [float(max(0, h_med - 10)), float(max(0, s_med - 40, s_med * 0.6)), float(max(0, v_med - 50))]
+    upper = [float(min(179, h_med + 10)), float(min(255, s_med + 40)), float(min(255, v_med + 50))]
     return lower, upper, median.tolist()
 
 
@@ -164,8 +168,16 @@ def sample_background_color(
     # classified that shadow as foreground instead of background, bridging
     # two separate wires into one run. H/S stay tight since those are what
     # actually distinguish table from a colored wire.
-    lower = [max(0, h_med - 12), max(0, s_med - 25), 0]
-    upper = [min(179, h_med + 12), min(255, s_med + 25), 255]
+    # Every element is explicitly cast to float - max()/min() against a
+    # literal bound (0, 179, 255) can otherwise return that literal's own
+    # Python int type instead of the numpy float the other elements are,
+    # which silently builds a lower/upper pair with different dtypes once
+    # passed through np.array() - cv2.inRange then raises (lb.type() ==
+    # ub.type() assertion) rather than just comparing values. Verified
+    # against a uniform/flat background (e.g. a plain white production
+    # backdrop) where s_med/v_med land exactly at a clipped bound.
+    lower = [float(max(0, h_med - 12)), float(max(0, s_med - 25)), 0.0]
+    upper = [float(min(179, h_med + 12)), float(min(255, s_med + 25)), 255.0]
     return lower, upper, median.tolist()
 
 
