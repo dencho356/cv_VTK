@@ -15,6 +15,8 @@
       "expected_wire_strand_count": 3,
       "_expected_wire_strand_count_comment": "count_wire_strands_at_row (app/plate_detector.py) is a color-independent physical wire count, meant to catch an extra/wrong-colored wire that per-slot color matching would silently miss - but this harness's wires are dressed close enough together that they visibly cross within the photographed margin (verified against dataset/incoming 20260819T144047849976.jpeg), so no margin/row gave an exact 5-of-5 count. 3 is what the algorithm itself consistently returns for a real, correctly-wired 5-wire photo (calibrated across 5 of the 8 real photos in dataset/incoming on 2026-08-19) - it's a baseline for THIS algorithm's own output, not a literal wire tally. check_wire_count is off until validated live (see require_solder_reach's history in this same file - a static-photo pass here is not a live-camera guarantee).",
       "strip_position": "bottom",
+      "photo_seam_edge": "right",
+      "_photo_seam_edge_comment": "2026-09-05: used only by app/harness_photo.py's two-photo (dedicated close-up) pipeline, NOT the strip_position/rectify_plate pipeline above - the plate is now rotated 90 degrees for that dedicated bottom.jpg photo, so this harness's wires run toward the LEFT of their own photo (per the user) rather than hanging straight down the middle of a wider whole-plate shot, meaning the board seam itself sits at the photo's RIGHT edge. Best guess from the user's description ('multicolor wires on the left'), not yet confirmed against a real sample photo - flip to 'left' if wires actually turn out anchored on the photo's own left edge instead.",
       "wire_slots": [
         {
           "slot": 1,
@@ -58,6 +60,8 @@
       "expected_wire_strand_count": 5,
       "_expected_wire_strand_count_comment": "Unlike the default harness, this one's wires separate cleanly enough for count_wire_strands_at_row to hit an EXACT match against the real wire count (5) on 6 of the 8 real photos in dataset/incoming (2026-08-19) - the other 2 are a different, 6-wire board and correctly land on a mismatch (9, not 5; the raw number isn't meaningful, only the mismatch is). Still off by default pending live validation (see require_solder_reach's history in this file).",
       "strip_position": "top",
+      "photo_seam_edge": "left",
+      "_photo_seam_edge_comment": "2026-09-05: see the matching comment on the 'default' harness - the rotated plate puts this harness's wires toward the RIGHT of their own upper.jpg photo (per the user), so the board seam sits at that photo's LEFT edge. Same caveat: best guess, not yet confirmed against a real sample photo.",
       "wire_slots": [
         {
           "slot": 1,

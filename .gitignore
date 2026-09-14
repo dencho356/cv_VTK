@@ -5,3 +5,4 @@ logs/*.jsonl
 dataset/incoming/*
 !dataset/incoming/.gitkeep
 models/
+accumulator_check/dataset/
