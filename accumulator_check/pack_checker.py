@@ -44,34 +44,43 @@ through two generations before landing here:
      why combining them (rather than replacing one with the other) is
      what closed most of the gap.
 
-  3. Confirmed against TWO separate real photos (both user-reported
-     false FAILs on known-good packs, 2026-09-14) that the remaining
-     failure mode is a corner cell, every time: the diagonal corner tape
-     casts a shadow across part of that cell's disc, which _color_score
-     misreads (texture reads it fine) - same class of cause as (1), now
-     nailed down to exactly where it happens. Tried three more targeted
-     fixes on the MAIN score (a shared median radius, capping color's
-     z-score outliers, a per-cell relative-brightness threshold, an
-     inward-shifted sampling center) plus blending a LAB chroma signal
-     into every cell's score - none of those closed it without breaking
-     a different cell elsewhere.
-  4. What finally worked: L*a*b* chroma (_lab_chroma_score) turned out to
-     be far less shadow-sensitive than brightness/saturation - the same
-     shadowed corner's chroma matched its OWN column's other 4 members
-     much more closely than the opposing column's. Rather than blend
-     this into every cell's score (tried that in step 3, made things
-     worse broadly), classify_pack uses it ONLY as a targeted cross-check
-     on a corner that's ALREADY flagged: compare that corner's chroma
-     against its own column's other rows vs. against the columns holding
-     the opposite sign, and override only when chroma clearly sides with
-     its own column. Closed the last false flag (1 -> 0 across all 4
-     "correct" photos) without suppressing detection elsewhere (applied
-     to only 7 of 36 "defect" photos' flagged corners, each of which
-     still had other, non-corner mismatches reported).
+  3. Confirmed against a SECOND real photo (also a user-reported false
+     FAIL on a known-good pack, 2026-09-14) that the remaining failure
+     mode is a corner cell, every time: the diagonal corner tape casts a
+     shadow across part of that cell's disc, which _color_score misreads
+     (texture reads it fine) - same class of cause as (1), now nailed
+     down to exactly where it happens. Tried three more targeted fixes on
+     the MAIN score (a shared median radius, capping color's z-score
+     outliers, a per-cell relative-brightness threshold, an inward-
+     shifted sampling center) plus blending a LAB chroma signal into
+     every cell's score - none of those closed it without breaking a
+     different cell elsewhere.
+  4. First fix tried: L*a*b* chroma (the B channel), which is far less
+     shadow-sensitive than brightness/saturation - the second case's
+     shadowed corner had chroma matching its OWN column's other 4
+     members much more closely than the opposing column's, used as a
+     targeted cross-check only on already-flagged corners (not blended
+     into every cell's score - tried that too, made things worse
+     broadly). Closed that case (1 -> 0 false flags on "correct" photos),
+     but a THIRD real photo (also user-reported, 2026-09-15) turned up a
+     shadowed corner where chroma's own margin was too close to call
+     (3.1 vs 2.6, noise-level) - chroma didn't reliably generalize.
+  5. What actually closed it: the SAME cross-check structure, but using
+     TEXTURE (_texture_score) instead of chroma - texture had already
+     read every shadowed corner correctly across all three real photos
+     tested (chroma only got 1 of 2 conclusively), which makes sense
+     causally: the tape's shadow changes a corner's apparent BRIGHTNESS,
+     not its physical surface, so texture is exactly the kind of signal a
+     shadow shouldn't touch. Confirmed this also correctly leaves a REAL
+     corner defect alone rather than erasing it: a genuinely swapped
+     corner cell is an actually different physical surface, so its
+     texture should resemble the OPPOSING columns, not its own, and the
+     override requires the corner's texture to side with its own column
+     to fire at all.
 
 Every corner cell still gets marked low_confidence regardless of the
-above (see classify_pack) - the LAB cross-check has only been run against
-this one dataset so far, not proven as thoroughly as the main signal.
+above (see classify_pack) - this cross-check has only been run against
+three real photos so far, nowhere near as thoroughly as the main signal.
 
 A correctly-alternating 6x6 pack is always 18 "+" / 18 "-" overall, so
 plus_count/minus_count (see check_pack) is a cheap independent sanity
@@ -101,6 +110,30 @@ _MAX_RADIUS = 130
 _MIN_DIST = 170
 
 
+def _reject_isolated_circles(circles: np.ndarray) -> np.ndarray:
+    """Drop any detected circle whose nearest OTHER detected circle is
+    much farther away than typical. Every real cell has a real neighbor
+    at roughly the grid's own pitch (measured ~195-250px in the reference
+    dataset), while a false positive from background clutter has no real
+    neighbor nearby at all - confirmed 2026-09-15 against a real photo
+    where a white power cable curving through the background got picked
+    up as an extra circle 733px from its nearest neighbor, versus every
+    real cell's 194-248px, and that one photo failed detection outright
+    (37 circles, never exactly 36) until this filter was added. The
+    threshold is relative to THIS photo's own median nearest-neighbor
+    distance, not a fixed px count, so it isn't tied to one specific
+    camera distance/zoom.
+    """
+    if len(circles) < 2:
+        return circles
+    coords = circles[:, :2]
+    nearest_neighbor_dist = np.array(
+        [np.min(np.hypot(*(coords - coords[i]).T)[np.arange(len(coords)) != i]) for i in range(len(coords))]
+    )
+    threshold = np.median(nearest_neighbor_dist) * 1.8
+    return circles[nearest_neighbor_dist <= threshold]
+
+
 def detect_cell_grid(image: np.ndarray) -> tuple[dict[tuple[int, int], tuple[float, float, float]] | None, str | None]:
     """Locate all 36 cells and assign each a (row, col) index, tolerant of
     camera tilt/skew: rows are found by 1D k-means on y (not a fixed pitch
@@ -124,8 +157,11 @@ def detect_cell_grid(image: np.ndarray) -> tuple[dict[tuple[int, int], tuple[flo
             gray_blurred, cv2.HOUGH_GRADIENT, dp=1.2, minDist=_MIN_DIST,
             param1=60, param2=param2, minRadius=_MIN_RADIUS, maxRadius=_MAX_RADIUS,
         )
-        if found is not None and len(found[0]) == EXPECTED_ROWS * EXPECTED_COLS:
-            circles = found[0]
+        if found is None:
+            continue
+        filtered = _reject_isolated_circles(found[0])
+        if len(filtered) == EXPECTED_ROWS * EXPECTED_COLS:
+            circles = filtered
             break
     if circles is None:
         return None, "could not find exactly 36 cell circles in this photo"
@@ -215,35 +251,14 @@ def _texture_score(gray: np.ndarray, x: float, y: float, r: float) -> float:
     return float(values.var()) if values.size else 0.0
 
 
-def _lab_chroma_score(lab: np.ndarray, x: float, y: float, r: float) -> float:
-    """Mean L*a*b* B-channel (blue-yellow chroma) in the cell's ring
-    annulus (0.65r-0.95r, same band _color_score's ring_fraction covers).
-    Added specifically to cross-check a flagged CORNER cell (see
-    classify_pack) after confirming against a real photo (2026-09-14)
-    that the corner tape's shadow drops a corner's LAB lightness (L) and
-    throws off _color_score's brightness-dependent reading, but leaves
-    this chroma channel close to its own column's other members - chroma
-    is far less sensitive to a lighting/shadow difference than brightness
-    or saturation are, which is exactly the failure mode _color_score has
-    at these positions. Tried blending this into _combined_scores for
-    every cell first; that made things WORSE overall (more false flags,
-    not fewer) - chroma isn't uniformly more reliable, it specifically
-    rescues the shadowed-corner case, so it's only used there.
-    """
-    mask = np.zeros(lab.shape[:2], dtype=np.uint8)
-    cv2.circle(mask, (int(x), int(y)), int(r * 0.95), 255, -1)
-    cv2.circle(mask, (int(x), int(y)), int(r * 0.65), 0, -1)
-    b_channel = lab[:, :, 2]
-    selected = mask > 0
-    return float(b_channel[selected].mean()) if np.any(selected) else 0.0
-
-
 def _zscore(values: list[float]) -> np.ndarray:
     arr = np.array(values, dtype=np.float64)
     return (arr - arr.mean()) / (arr.std() + 1e-9)
 
 
-def _combined_scores(image: np.ndarray, items: list[tuple[tuple[int, int], tuple[float, float, float]]]) -> np.ndarray:
+def _combined_scores(
+    image: np.ndarray, items: list[tuple[tuple[int, int], tuple[float, float, float]]]
+) -> tuple[np.ndarray, np.ndarray]:
     """Per-photo z-scored blend of _texture_score and _color_score (see
     _TEXTURE_WEIGHT) - z-scoring each signal separately (not just summing
     raw values) matters because they live on completely different scales
@@ -252,12 +267,16 @@ def _combined_scores(image: np.ndarray, items: list[tuple[tuple[int, int], tuple
     absolute scale of EITHER signal varies photo to photo (lighting,
     exposure) the same way _color_score alone did - see classify_pack for
     why clustering happens per-photo rather than against a fixed cutoff.
+
+    Returns (combined, texture_z) - the raw z-scored texture signal is
+    also returned on its own for classify_pack's corner cross-check (see
+    there), which needs texture in isolation, not blended with color.
     """
     gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
     hsv = cv2.cvtColor(image, cv2.COLOR_BGR2HSV)
     texture = _zscore([_texture_score(gray, x, y, r) for _, (x, y, r) in items])
     color = _zscore([_color_score(hsv, x, y, r) for _, (x, y, r) in items])
-    return _TEXTURE_WEIGHT * texture + color
+    return _TEXTURE_WEIGHT * texture + color, texture
 
 
 def classify_pack(image: np.ndarray, grid: dict[tuple[int, int], tuple[float, float, float]]) -> dict[str, Any]:
@@ -282,7 +301,8 @@ def classify_pack(image: np.ndarray, grid: dict[tuple[int, int], tuple[float, fl
     concentrated in testing.
     """
     items = list(grid.items())
-    scores = _combined_scores(image, items).reshape(-1, 1).astype(np.float32)
+    combined, texture_z = _combined_scores(image, items)
+    scores = combined.reshape(-1, 1).astype(np.float32)
 
     _, labels, centers = cv2.kmeans(
         scores, 2, None,
@@ -331,35 +351,45 @@ def classify_pack(image: np.ndarray, grid: dict[tuple[int, int], tuple[float, fl
         if info["margin"] < 0.4 or (row, col) in corner_cells:
             low_confidence.append((row, col))
 
-    # Cross-check any FLAGGED corner against its own column using LAB
-    # chroma (see _lab_chroma_score) - confirmed 2026-09-14 against a
-    # real photo that this specific comparison (a corner's chroma vs. its
-    # own column's other rows vs. the columns holding the opposite sign)
-    # correctly recognizes a corner that only misread on brightness,
-    # closing the one remaining false flag from the color+texture signal
-    # above. Still only overrides the SPECIFIC corners currently flagged
-    # - every corner stays in low_confidence either way (see above),
-    # since this cross-check hasn't been tried on nearly as many photos
-    # as the main signal has.
-    lab_image = cv2.cvtColor(image, cv2.COLOR_BGR2LAB)
+    # Cross-check any FLAGGED corner against its own column using TEXTURE
+    # ALONE (not blended with color, unlike the main score) - confirmed
+    # against TWO separate real photos (2026-09-14) that texture keeps
+    # reading a shadowed corner correctly even when color is a strong
+    # outlier there, so a corner's own texture_z compared against its
+    # column's other rows vs. the opposing-sign columns' texture_z
+    # resolves exactly the case _combined_scores gets wrong. (A first
+    # attempt at this cross-check used LAB chroma instead - it resolved
+    # the first real case but was ambiguous, not clearly either way, on
+    # the second; texture wasn't ambiguous in either.) This is also
+    # theoretically why texture should be trustworthy here specifically:
+    # the tape's shadow changes a corner's apparent BRIGHTNESS, not its
+    # physical surface - the button's groove pattern - so a genuinely
+    # swapped corner cell (a real defect, not a shadow artifact) should
+    # still show texture matching the OPPOSING columns, not its own, and
+    # this override would correctly decline to fire for it. Still only
+    # overrides the SPECIFIC corners currently flagged - every corner
+    # stays in low_confidence either way (see above), since this cross-
+    # check hasn't been run against nearly as many photos as the main
+    # signal has.
+    texture_z_map = {rc: float(texture_z[i]) for i, (rc, _) in enumerate(items)}
     for row, col in list(mismatches):
         if (row, col) not in corner_cells:
             continue
         other_rows_in_col = [r for r in range(EXPECTED_ROWS) if (r, col) not in corner_cells]
-        own_column_chroma = float(np.mean([_lab_chroma_score(lab_image, *grid[(r, col)]) for r in other_rows_in_col]))
-        corner_chroma = _lab_chroma_score(lab_image, *grid[(row, col)])
-        opposing_chroma_samples = [
-            _lab_chroma_score(lab_image, *grid[(r, c)])
+        own_column_texture = float(np.mean([texture_z_map[(r, col)] for r in other_rows_in_col]))
+        corner_texture = texture_z_map[(row, col)]
+        opposing_texture_samples = [
+            texture_z_map[(r, c)]
             for c in range(EXPECTED_COLS) if col_majority[c] != col_majority[col]
             for r in range(EXPECTED_ROWS) if (r, c) not in corner_cells
         ]
-        if not opposing_chroma_samples:
+        if not opposing_texture_samples:
             continue
-        opposing_chroma = float(np.mean(opposing_chroma_samples))
-        if abs(corner_chroma - own_column_chroma) < abs(corner_chroma - opposing_chroma):
+        opposing_texture = float(np.mean(opposing_texture_samples))
+        if abs(corner_texture - own_column_texture) < abs(corner_texture - opposing_texture):
             cells[(row, col)]["sign"] = col_majority[col]
             cells[(row, col)]["pass"] = True
-            cells[(row, col)]["lab_override"] = True
+            cells[(row, col)]["texture_override"] = True
             mismatches.remove((row, col))
 
     # Plain +/- tally across all 36 cells, independent of the column-
