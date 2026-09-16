@@ -288,10 +288,18 @@ def classify_pack(image: np.ndarray, grid: dict[tuple[int, int], tuple[float, fl
     on others, whereas the two classes are still cleanly bimodal within
     any single photo.
 
-    A cell's own "sign" is then compared against its COLUMN's majority
-    sign (not a hardcoded absolute pattern) - the confirmed rule tolerates
-    either global polarity (a pack can be seated either way), so only a
-    LOCAL disagreement within a column is treated as a possible defect.
+    A cell's own "sign" is compared against what its column SHOULD be
+    under the whole pack's best-fit alternating template (see
+    expected_by_column below), not just against its own column's raw
+    majority - the confirmed rule tolerates either global starting
+    polarity (a pack can be seated either way), but does NOT tolerate two
+    ADJACENT columns sharing a sign. An earlier version of this function
+    only checked a cell against its own column's majority, which caught a
+    single mis-seated cell fine but had a real blind spot (2026-09-16,
+    user-reported): a column whose EVERY cell agreed with each other but
+    whose majority itself broke the alternation (e.g. two neighboring
+    columns both "+") was invisible to that check, since nothing there
+    ever compared one column against another.
 
     low_confidence lists cells whose score sits close to the midpoint
     between this photo's two cluster centers - per the calibration note
@@ -321,60 +329,57 @@ def classify_pack(image: np.ndarray, grid: dict[tuple[int, int], tuple[float, fl
         margin = abs(float(score) - midpoint) / half_gap if half_gap > 1e-6 else 0.0
         cells[rc] = {"sign": sign, "score": float(score), "margin": round(margin, 2)}
 
+    # The 4 physical corner cells sit right where the diagonal corner
+    # tape crosses closest to the pack - confirmed against three separate
+    # real photos (2026-09-14 through 2026-09-16, all user-reported) that
+    # this specific tape proximity casts a shadow across part of a corner
+    # cell's disc, skewing _color_score toward a false reading even
+    # though _texture_score reads that same cell correctly. Tried three
+    # targeted fixes on the color signal itself (a shared median radius,
+    # capping color's z-score outliers, a per-cell relative-brightness
+    # threshold) - none resolved it, so corners are excluded from
+    # col_majority below rather than trusted at face value, and separately
+    # cross-checked against their own column via texture further down.
+    corner_cells = {(0, 0), (0, EXPECTED_COLS - 1), (EXPECTED_ROWS - 1, 0), (EXPECTED_ROWS - 1, EXPECTED_COLS - 1)}
+
     col_signs: dict[int, list[str]] = {c: [] for c in range(EXPECTED_COLS)}
     for (row, col), info in cells.items():
+        if (row, col) in corner_cells:
+            continue
         col_signs[col].append(info["sign"])
     col_majority = {c: max(set(signs), key=signs.count) for c, signs in col_signs.items()}
 
-    # The 4 physical corner cells sit right where the diagonal corner
-    # tape crosses closest to the pack - confirmed against two separate
-    # real photos (2026-09-14, user-reported) that this specific tape
-    # proximity casts a shadow across part of a corner cell's disc,
-    # dropping it below the metal-brightness cutoff and skewing
-    # _color_score toward a false "+" even though _texture_score reads
-    # that same cell correctly. Tried three targeted fixes (a shared
-    # median radius instead of each cell's own noisy Hough radius,
-    # capping color's z-score outliers, and a per-cell relative-
-    # brightness threshold instead of the fixed one) - none resolved it
-    # without introducing new false flags elsewhere, so corners are
-    # unconditionally treated as low_confidence rather than trusted at
-    # face value, regardless of their own margin.
-    corner_cells = {(0, 0), (0, EXPECTED_COLS - 1), (EXPECTED_ROWS - 1, 0), (EXPECTED_ROWS - 1, EXPECTED_COLS - 1)}
-
-    mismatches = []
-    low_confidence = []
-    for (row, col), info in cells.items():
-        info["expected"] = col_majority[col]
-        info["pass"] = info["sign"] == col_majority[col]
-        if not info["pass"]:
-            mismatches.append((row, col))
-        if info["margin"] < 0.4 or (row, col) in corner_cells:
-            low_confidence.append((row, col))
-
-    # Cross-check any FLAGGED corner against its own column using TEXTURE
-    # ALONE (not blended with color, unlike the main score) - confirmed
-    # against TWO separate real photos (2026-09-14) that texture keeps
-    # reading a shadowed corner correctly even when color is a strong
-    # outlier there, so a corner's own texture_z compared against its
-    # column's other rows vs. the opposing-sign columns' texture_z
-    # resolves exactly the case _combined_scores gets wrong. (A first
-    # attempt at this cross-check used LAB chroma instead - it resolved
-    # the first real case but was ambiguous, not clearly either way, on
-    # the second; texture wasn't ambiguous in either.) This is also
-    # theoretically why texture should be trustworthy here specifically:
-    # the tape's shadow changes a corner's apparent BRIGHTNESS, not its
-    # physical surface - the button's groove pattern - so a genuinely
-    # swapped corner cell (a real defect, not a shadow artifact) should
-    # still show texture matching the OPPOSING columns, not its own, and
-    # this override would correctly decline to fire for it. Still only
-    # overrides the SPECIFIC corners currently flagged - every corner
-    # stays in low_confidence either way (see above), since this cross-
-    # check hasn't been run against nearly as many photos as the main
-    # signal has.
+    # Cross-check EVERY corner (not just ones already disagreeing with
+    # the column below - see why this matters next) against its own
+    # column using TEXTURE ALONE (not blended with color, unlike the main
+    # score) - confirmed against three real photos (2026-09-14 through
+    # 2026-09-16) that texture keeps reading a shadowed corner correctly
+    # even when color is a strong outlier there, so a corner's own
+    # texture_z compared against its column's other rows vs. the
+    # opposing-sign columns' texture_z resolves exactly the case
+    # _combined_scores gets wrong. (A first attempt at this cross-check
+    # used LAB chroma instead - it resolved one real case but was
+    # ambiguous, not clearly either way, on a second; texture wasn't
+    # ambiguous on either.) This is also theoretically why texture should
+    # be trustworthy here specifically: the tape's shadow changes a
+    # corner's apparent BRIGHTNESS, not its physical surface - the
+    # button's groove pattern - so a genuinely swapped corner cell (a
+    # real defect, not a shadow artifact) should still show texture
+    # matching the OPPOSING columns, not its own, and this override would
+    # correctly decline to fire for it.
+    #
+    # Applying this to EVERY corner, not only ones _combined_scores
+    # already flagged, closed a real gap (2026-09-16, user-reported): a
+    # corner whose bad color reading happened to coincidentally match
+    # what the alternating pattern expected slipped through as a false
+    # PASS, because it was never a "mismatch" to begin with, so the
+    # earlier version of this cross-check (which only ran on already-
+    # flagged corners) never got a chance to look at it. Comparing every
+    # corner's texture against its own (corner-excluded, so uncontaminated
+    # by this exact problem) column majority regardless of the corner's
+    # current pass/fail status is what catches that.
     texture_z_map = {rc: float(texture_z[i]) for i, (rc, _) in enumerate(items)}
-    for row, col in list(mismatches):
-        if (row, col) not in corner_cells:
-            continue
+    for row, col in sorted(corner_cells):
         other_rows_in_col = [r for r in range(EXPECTED_ROWS) if (r, col) not in corner_cells]
         own_column_texture = float(np.mean([texture_z_map[(r, col)] for r in other_rows_in_col]))
         corner_texture = texture_z_map[(row, col)]
@@ -388,25 +393,55 @@ def classify_pack(image: np.ndarray, grid: dict[tuple[int, int], tuple[float, fl
         opposing_texture = float(np.mean(opposing_texture_samples))
         if abs(corner_texture - own_column_texture) < abs(corner_texture - opposing_texture):
             cells[(row, col)]["sign"] = col_majority[col]
-            cells[(row, col)]["pass"] = True
             cells[(row, col)]["texture_override"] = True
-            mismatches.remove((row, col))
 
-    # Plain +/- tally across all 36 cells, independent of the column-
-    # majority check above - e.g. useful as a quick sanity total (a
-    # correctly alternating 6x6 pack is always 18/18) even before looking
-    # at which specific cells disagree with their column.
+    # Fit the 6 observed (corner-excluded, texture-corrected) column-
+    # majorities against BOTH possible perfect alternating templates
+    # (starting "+" or starting "-") and keep whichever the majority of
+    # columns already agrees with. This is what preserves "either global
+    # polarity is fine" while still catching a column whose OWN majority
+    # breaks the alternation with its neighbor - expected_by_column, not
+    # col_majority, is what every cell's sign (corners included) gets
+    # checked against below.
+    template_plus_first = {c: ("+" if c % 2 == 0 else "-") for c in range(EXPECTED_COLS)}
+    template_minus_first = {c: ("-" if c % 2 == 0 else "+") for c in range(EXPECTED_COLS)}
+    agree_plus_first = sum(1 for c in range(EXPECTED_COLS) if col_majority[c] == template_plus_first[c])
+    agree_minus_first = EXPECTED_COLS - agree_plus_first
+    expected_by_column = template_plus_first if agree_plus_first >= agree_minus_first else template_minus_first
+
+    mismatches = []
+    low_confidence = []
+    for (row, col), info in cells.items():
+        info["expected"] = expected_by_column[col]
+        info["pass"] = info["sign"] == expected_by_column[col]
+        if not info["pass"]:
+            mismatches.append((row, col))
+        if info["margin"] < 0.4 or (row, col) in corner_cells:
+            low_confidence.append((row, col))
+
+    # Plain +/- tally across all 36 cells - independent of the per-cell
+    # mismatch check above, but not actually a separate possible failure
+    # mode given EXPECTED_ROWS/EXPECTED_COLS are both even and
+    # expected_by_column is a strict alternation: zero mismatches already
+    # mathematically guarantees 18/18. Reported explicitly anyway (a
+    # requirement in its own right, 2026-09-16) since it's a much simpler
+    # thing for a caller to check/display than walking the full mismatch
+    # list, and it stays meaningful as an independent cross-check if this
+    # grid's dimensions ever change.
     plus_count = sum(1 for info in cells.values() if info["sign"] == "+")
     minus_count = len(cells) - plus_count
+    counts_balanced = plus_count == minus_count
 
     return {
         "cells": cells,
         "column_majority": col_majority,
+        "expected_by_column": expected_by_column,
         "mismatches": mismatches,
         "low_confidence": low_confidence,
         "plus_count": plus_count,
         "minus_count": minus_count,
-        "pass": len(mismatches) == 0,
+        "counts_balanced": counts_balanced,
+        "pass": len(mismatches) == 0 and counts_balanced,
     }
 
 
